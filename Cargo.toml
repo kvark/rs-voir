@@ -1,0 +1,9 @@
+[package]
+name = "rs-voir"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+
+[dependencies]
+rand = "0.8"
