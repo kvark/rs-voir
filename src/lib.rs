@@ -1,3 +1,7 @@
+#![warn(missing_docs)]
+
+//! Basic implementation of a Reservoir.
+
 use rand::Rng;
 
 /// Builder for a reservoir. Can stream in new samples and merge
@@ -17,6 +21,7 @@ pub struct Reservoir {
 }
 
 impl Reservoir {
+    /// Construct a reservoir from a single sample.
     pub fn from_sample(source_pdf: f32) -> Self {
         Self {
             history: 1,
@@ -24,6 +29,7 @@ impl Reservoir {
         }
     }
 
+    /// Convert the reservoir back into a builder state.
     pub fn into_builder(self, selected_target_pdf: f32) -> ReservoirBuilder {
         ReservoirBuilder {
             history: self.history,
@@ -78,6 +84,11 @@ impl ReservoirBuilder {
             let other = Reservoir::from_sample(source_pdf).into_builder(target_value);
             self.merge(&other, random)
         }
+    }
+
+    /// Register a sample with zero value.
+    pub fn add_empty_sample(&mut self) {
+        self.history += 1;
     }
 
     /// Merge another reservoir into this one.
