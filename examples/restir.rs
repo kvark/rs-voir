@@ -1,3 +1,17 @@
+/*!
+Spatio-temporal Reservoir Resample (aka ReSTIR) example.
+
+The 2D world consists of:
+    - ground surface receiving the light
+    - occluder (a line segment at specified height)
+    - sun (a unit sphere at specified location)
+    - sky (the rest of the hemisphere)
+
+This example implements ReSTIR for this world,
+and shows the averaged (over time) brightness
+for each point on the ground.
+!*/
+
 use std::{ops::Range, time::Duration};
 
 struct Output {
@@ -97,10 +111,16 @@ impl tui::widgets::Widget for WorldView<'_> {
     }
 }
 
+#[derive(Clone, Default)]
+struct SampleInfo {
+    dir: glam::Vec2,
+    distance: Option<f32>,
+}
+
 #[derive(Default)]
 struct Pixel {
     reservoir: rs_voir::Reservoir,
-    selected_dir: glam::Vec2,
+    selected_sample: SampleInfo,
     brightness: f32,
     brightness_accumulated: f32,
 }
@@ -110,6 +130,7 @@ struct RestirConfig {
     initial_visibility: bool,
     reuse_temporal: bool,
     reuse_spatial: bool,
+    avoid_bias: bool,
     max_history: u32,
 }
 
@@ -119,20 +140,33 @@ struct Config {
     accumulation: f32,
 }
 
+#[derive(Default)]
+struct LightInfo {
+    intensity: f32,
+    distance: Option<f32>,
+}
+
 impl WorldConfig {
-    fn get_incoming_light(&self, origin: glam::Vec2, dir: glam::Vec2) -> f32 {
+    fn get_incoming_light(&self, origin: glam::Vec2, dir: glam::Vec2) -> LightInfo {
         debug_assert!(dir.is_normalized());
         let sun_pos = glam::vec2(
             self.sun_position[0] as f32 + 0.5,
             self.sun_position[1] as f32 + 0.5,
         );
         let diff = sun_pos - origin;
-        let leftover = diff - diff.dot(dir) * dir;
+        let sun_distance = diff.dot(dir);
+        let leftover = diff - sun_distance * dir;
         let sun_radius = 0.5;
         if leftover.length_squared() < sun_radius * sun_radius {
-            self.sun_intensity
+            LightInfo {
+                intensity: self.sun_intensity,
+                distance: Some(sun_distance),
+            }
         } else {
-            self.sky_intensity
+            LightInfo {
+                intensity: self.sky_intensity,
+                distance: None,
+            }
         }
     }
 
@@ -162,11 +196,19 @@ impl Render {
 
         self.frame_index += 1;
 
+        // Back up the current information before re-using
+        let backup = self
+            .pixels
+            .iter()
+            .map(|pixel| (pixel.reservoir.clone(), pixel.selected_sample.clone()))
+            .collect::<Vec<_>>();
+
         for (cell_index, pixel) in self.pixels.iter_mut().enumerate() {
             let surface_pos = glam::vec2(cell_index as f32 + 0.5, 0.0);
             let mut builder = rs_voir::ReservoirBuilder::default();
             let mut selected_dir = glam::Vec2::ZERO;
-            let mut selected_intencity = 0.0;
+            let mut selected_linfo = LightInfo::default();
+
             // First, do RIS on the initial samples
             for _ in 0..self.config.restir.initial_samples {
                 // generate a random direction in the hemisphere
@@ -177,13 +219,14 @@ impl Render {
                 {
                     builder.add_empty_sample();
                 } else {
-                    let intensity = self.config.world.get_incoming_light(surface_pos, dir);
-                    if builder.stream(1.0 / PI, intensity, &mut self.random) {
+                    let linfo = self.config.world.get_incoming_light(surface_pos, dir);
+                    if builder.stream(1.0 / PI, linfo.intensity, &mut self.random) {
                         selected_dir = dir;
-                        selected_intencity = intensity;
+                        selected_linfo = linfo;
                     }
                 }
             }
+
             // From now on, we consider visibility to be a part of the target PDF.
             // Therefore, if the given reservoir was built without visibility checks,
             // it's time to collapse it to one sample, which we also check now.
@@ -193,21 +236,134 @@ impl Render {
                     .world
                     .check_visibility(surface_pos, selected_dir)
                 {
-                    selected_intencity = 0.0;
+                    builder.invalidate();
+                    selected_linfo = LightInfo::default();
                 }
                 builder.collapse();
             }
 
-            // Second, reuse the previous frame reservoir
-            if self.config.restir.reuse_temporal {}
+            // Second, reuse the previous frame reservoir.
+            if self.config.restir.reuse_temporal {
+                let (ref prev_reservoir, ref prev_sample) = backup[cell_index];
+                if prev_reservoir.has_weight() {
+                    // reconstruct the target PDF
+                    let linfo = self
+                        .config
+                        .world
+                        .get_incoming_light(surface_pos, pixel.selected_sample.dir);
+                    let other = prev_reservoir.to_builder(linfo.intensity);
+                    if builder.merge(&other, &mut self.random) {
+                        selected_dir = prev_sample.dir;
+                        selected_linfo = linfo;
+                    }
+                } else {
+                    builder.merge_history(prev_reservoir);
+                }
+            }
 
             // Third, reuse the previous frame neighboring reservoirs
-            if self.config.restir.reuse_spatial {}
+            if self.config.restir.reuse_spatial {
+                // The current `builder` is the "canonical" reservoir -
+                // one that can be trusted. We want to try merging other reservoirs,
+                // which may be biased, but we'll only know it after the merge.
+                let mut is_changed = false;
+                // First pass, merge all valid reservoirs in, just to find the winning sample.
+                for offset in [-1, 1] {
+                    let index = cell_index as isize + offset;
+                    if index < 0 || index >= self.config.world.surface_length as isize {
+                        continue;
+                    }
+                    let (ref prev_reservoir, ref prev_sample) = backup[index as usize];
+                    let other_pos = surface_pos + glam::vec2(offset as f32, 0.0);
+
+                    if prev_reservoir.has_weight() {
+                        // shift map the direction to the current sample
+                        let dir = match prev_sample.distance {
+                            Some(distance) => {
+                                (other_pos + distance * prev_sample.dir - surface_pos).normalize()
+                            }
+                            None => prev_sample.dir,
+                        };
+                        // reconstruct the target PDF
+                        let linfo = self.config.world.get_incoming_light(surface_pos, dir);
+                        let other = prev_reservoir.to_builder(linfo.intensity);
+                        if builder.merge(&other, &mut self.random) {
+                            selected_dir = dir;
+                            selected_linfo = linfo;
+                            is_changed = true;
+                        }
+                    } else {
+                        builder.merge_history(prev_reservoir);
+                    }
+                }
+
+                if self.config.restir.avoid_bias {
+                    // Now go through the neighbors again, and check if they need to participate.
+                    for offset in [-1, 1] {
+                        let index = cell_index as isize + offset;
+                        if index < 0 || index >= self.config.world.surface_length as isize {
+                            continue;
+                        }
+                        let (ref prev_reservoir, ref prev_sample) = backup[index as usize];
+                        let other_pos = surface_pos + glam::vec2(offset as f32, 0.0);
+
+                        // shift map the direction to the other sample
+                        let visibility_dir = match selected_linfo.distance {
+                            Some(distance) => {
+                                (surface_pos + distance * selected_dir - other_pos).normalize()
+                            }
+                            None => selected_dir,
+                        };
+                        if self
+                            .config
+                            .world
+                            .check_visibility(other_pos, visibility_dir)
+                        {
+                            // Selected light/direction is visible from the neighbor,
+                            // nothing to fix here.
+                            continue;
+                        }
+
+                        // We detected that the chosen sample couldn't be visible from this
+                        // neighbor location, so we reject the neighbors contribution.
+                        if prev_reservoir.has_weight() {
+                            // shift map the direction to the current sample
+                            let dir = match prev_sample.distance {
+                                Some(distance) => (other_pos + distance * prev_sample.dir
+                                    - surface_pos)
+                                    .normalize(),
+                                None => prev_sample.dir,
+                            };
+                            // reconstruct the target PDF
+                            let linfo = self.config.world.get_incoming_light(surface_pos, dir);
+                            let other = prev_reservoir.to_builder(linfo.intensity);
+                            builder.unmerge(&other);
+                        } else {
+                            builder.unmerge_history(prev_reservoir);
+                        }
+                    }
+                }
+
+                // Finally, do the visibility check on the winning sample.
+                // During the spatial re-use we assumed the chosen sample was visible,
+                // but that assumption may not hold, so now is time to fix this.
+                if is_changed
+                    && !self
+                        .config
+                        .world
+                        .check_visibility(surface_pos, selected_dir)
+                {
+                    builder.invalidate();
+                }
+            }
 
             // Finally write out the results
             pixel.reservoir = builder.finish(self.config.restir.max_history);
-            pixel.selected_dir = selected_dir;
-            pixel.brightness = selected_intencity * pixel.reservoir.contribution_weight();
+            pixel.selected_sample = SampleInfo {
+                dir: selected_dir,
+                distance: selected_linfo.distance,
+            };
+            pixel.brightness = selected_linfo.intensity * pixel.reservoir.contribution_weight();
             pixel.brightness_accumulated = pixel.brightness_accumulated
                 * (1.0 - self.config.accumulation)
                 + self.config.accumulation * pixel.brightness;
@@ -240,14 +396,6 @@ impl Render {
             )
             .margin(1)
             .split(frame.size());
-
-        let info_block = w::Paragraph::new(vec![make_key_value(
-            "Frame: ",
-            format!("{}", self.frame_index),
-        )])
-        .block(w::Block::default().title("Info").borders(w::Borders::ALL))
-        .wrap(w::Wrap { trim: true });
-        frame.render_widget(info_block, top_hor_rects[1]);
 
         let top_ver_rects = l::Layout::default()
             .direction(l::Direction::Vertical)
@@ -285,9 +433,21 @@ impl Render {
             .data(&brightness)
             .bar_width(1)
             .bar_gap(0)
-            //.bar_style(Style::default().fg(Color::Yellow))
-            .value_style(Style::default().fg(Color::Black).bg(Color::Yellow));
+            .max(15);
         frame.render_widget(chart_block, top_ver_rects[1]);
+
+        let max_brightness = brightness
+            .iter()
+            .map(|&(_, br)| br)
+            .max()
+            .unwrap_or_default();
+        let info_block = w::Paragraph::new(vec![
+            make_key_value("Frame: ", format!("{}", self.frame_index)),
+            make_key_value("Max brightness: ", format!("{}", max_brightness)),
+        ])
+        .block(w::Block::default().title("Info").borders(w::Borders::ALL))
+        .wrap(w::Wrap { trim: true });
+        frame.render_widget(info_block, top_hor_rects[1]);
     }
 }
 
@@ -307,9 +467,10 @@ fn main() {
             },
             restir: RestirConfig {
                 initial_samples: 4,
-                initial_visibility: true,
-                reuse_temporal: false,
-                reuse_spatial: false,
+                initial_visibility: false,
+                reuse_temporal: true,
+                reuse_spatial: true,
+                avoid_bias: true,
                 max_history: 20,
             },
             accumulation: 0.01,
