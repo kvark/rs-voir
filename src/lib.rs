@@ -37,6 +37,11 @@ impl Reservoir {
             selected_target_pdf,
         }
     }
+
+    /// Return the contribution weight of the selected sample.
+    pub fn contribution_weight(&self) -> f32 {
+        self.contribution_weight
+    }
 }
 
 impl ReservoirBuilder {
@@ -44,9 +49,14 @@ impl ReservoirBuilder {
     /// Clamps history to a given value. History clamping allows reservoirs
     /// to pick up new samples in the future and not get stale.
     pub fn finish(self, max_history: u32) -> Reservoir {
+        let denom = self.history as f32 * self.selected_target_pdf;
         Reservoir {
             history: self.history.min(max_history),
-            contribution_weight: self.weight_sum / (self.history as f32 * self.selected_target_pdf),
+            contribution_weight: if denom > 0.0 {
+                self.weight_sum / denom
+            } else {
+                0.0
+            },
         }
     }
 

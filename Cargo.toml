@@ -10,4 +10,5 @@ rand = "0.8"
 
 [dev-dependencies]
 crossterm = "0.23"
+glam = "0.21"
 tui = "0.18"
