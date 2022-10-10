@@ -62,8 +62,8 @@ impl Drop for Output {
 struct WorldConfig {
     surface_length: u16,
     sun_position: [u16; 2],
-    sun_intensity: f32,
-    sky_intensity: f32,
+    sun_color: [f32; 3],
+    sky_color: [f32; 3],
     occluder_y: u16,
     occluder_x: Range<u16>,
 }
@@ -121,8 +121,8 @@ struct SampleInfo {
 struct Pixel {
     reservoir: rs_voir::Reservoir,
     selected_sample: SampleInfo,
-    brightness: f32,
-    brightness_accumulated: f32,
+    color: glam::Vec3,
+    color_accumulated: glam::Vec3,
 }
 
 struct RestirConfig {
@@ -142,8 +142,16 @@ struct Config {
 
 #[derive(Default)]
 struct LightInfo {
-    intensity: f32,
+    color: glam::Vec3,
     distance: Option<f32>,
+}
+
+impl LightInfo {
+    /// Returns the value we assign to this light, based on the color (or intensity).
+    /// This is also known as "unnormalized target PDF" in literature.
+    fn target_value(&self) -> f32 {
+        self.color.length()
+    }
 }
 
 impl WorldConfig {
@@ -159,12 +167,12 @@ impl WorldConfig {
         let sun_radius = 0.5;
         if leftover.length_squared() < sun_radius * sun_radius {
             LightInfo {
-                intensity: self.sun_intensity,
+                color: self.sun_color.into(),
                 distance: Some(sun_distance),
             }
         } else {
             LightInfo {
-                intensity: self.sky_intensity,
+                color: self.sky_color.into(),
                 distance: None,
             }
         }
@@ -220,7 +228,7 @@ impl Render {
                     builder.add_empty_sample();
                 } else {
                     let linfo = self.config.world.get_incoming_light(surface_pos, dir);
-                    if builder.stream(1.0 / PI, linfo.intensity, &mut self.random) {
+                    if builder.stream(1.0 / PI, linfo.target_value(), &mut self.random) {
                         selected_dir = dir;
                         selected_linfo = linfo;
                     }
@@ -251,7 +259,7 @@ impl Render {
                         .config
                         .world
                         .get_incoming_light(surface_pos, pixel.selected_sample.dir);
-                    let other = prev_reservoir.to_builder(linfo.intensity);
+                    let other = prev_reservoir.to_builder(linfo.target_value());
                     if builder.merge(&other, &mut self.random) {
                         selected_dir = prev_sample.dir;
                         selected_linfo = linfo;
@@ -286,7 +294,7 @@ impl Render {
                         };
                         // reconstruct the target PDF
                         let linfo = self.config.world.get_incoming_light(surface_pos, dir);
-                        let other = prev_reservoir.to_builder(linfo.intensity);
+                        let other = prev_reservoir.to_builder(linfo.target_value());
                         if builder.merge(&other, &mut self.random) {
                             selected_dir = dir;
                             selected_linfo = linfo;
@@ -336,7 +344,7 @@ impl Render {
                             };
                             // reconstruct the target PDF
                             let linfo = self.config.world.get_incoming_light(surface_pos, dir);
-                            let other = prev_reservoir.to_builder(linfo.intensity);
+                            let other = prev_reservoir.to_builder(linfo.target_value());
                             builder.unmerge(&other);
                         } else {
                             builder.unmerge_history(prev_reservoir);
@@ -363,10 +371,9 @@ impl Render {
                 dir: selected_dir,
                 distance: selected_linfo.distance,
             };
-            pixel.brightness = selected_linfo.intensity * pixel.reservoir.contribution_weight();
-            pixel.brightness_accumulated = pixel.brightness_accumulated
-                * (1.0 - self.config.accumulation)
-                + self.config.accumulation * pixel.brightness;
+            pixel.color = selected_linfo.color * pixel.reservoir.contribution_weight();
+            pixel.color_accumulated = pixel.color_accumulated * (1.0 - self.config.accumulation)
+                + self.config.accumulation * pixel.color;
         }
     }
 
@@ -382,6 +389,17 @@ impl Render {
             Spans(vec![
                 Span::styled(key, Style::default().fg(Color::DarkGray)),
                 Span::raw(value),
+            ])
+        }
+        fn make_key_bool(key: &str, value: bool) -> Spans {
+            let (color, value_str) = if value {
+                (Color::Green, "on")
+            } else {
+                (Color::Red, "off")
+            };
+            Spans(vec![
+                Span::styled(key, Style::default().fg(Color::DarkGray)),
+                Span::styled(value_str, Style::default().fg(color)),
             ])
         }
 
@@ -422,7 +440,7 @@ impl Render {
         let brightness = self
             .pixels
             .iter()
-            .map(|pixel| ("", pixel.brightness_accumulated as u64))
+            .map(|pixel| ("", (pixel.color_accumulated.length() * 100.0) as u64))
             .collect::<Vec<_>>();
         let chart_block = w::BarChart::default()
             .block(
@@ -433,7 +451,7 @@ impl Render {
             .data(&brightness)
             .bar_width(1)
             .bar_gap(0)
-            .max(15);
+            .max(200);
         frame.render_widget(chart_block, top_ver_rects[1]);
 
         let max_brightness = brightness
@@ -443,7 +461,25 @@ impl Render {
             .unwrap_or_default();
         let info_block = w::Paragraph::new(vec![
             make_key_value("Frame: ", format!("{}", self.frame_index)),
-            make_key_value("Max brightness: ", format!("{}", max_brightness)),
+            make_key_value(
+                "Max brightness: ",
+                format!("{:.2}", max_brightness as f32 / 100.0),
+            ),
+            make_key_value(
+                "Initial samples: ",
+                format!("{}", self.config.restir.initial_samples),
+            ),
+            make_key_bool(
+                "Initial visibility: ",
+                self.config.restir.initial_visibility,
+            ),
+            make_key_bool("Temporal reuse: ", self.config.restir.reuse_temporal),
+            make_key_bool("Spatial reuse: ", self.config.restir.reuse_spatial),
+            make_key_bool("Spatial de-biasing: ", self.config.restir.avoid_bias),
+            make_key_value(
+                "History clamp: ",
+                format!("{}", self.config.restir.max_history),
+            ),
         ])
         .block(w::Block::default().title("Info").borders(w::Borders::ALL))
         .wrap(w::Wrap { trim: true });
@@ -460,8 +496,8 @@ fn main() {
             world: WorldConfig {
                 surface_length,
                 sun_position: [5, 10],
-                sun_intensity: 100.0,
-                sky_intensity: 1.0,
+                sun_color: [10.0, 10.0, 1.0],
+                sky_color: [0.0, 0.0, 0.1],
                 occluder_y: 5,
                 occluder_x: 7..15,
             },
@@ -469,7 +505,7 @@ fn main() {
                 initial_samples: 4,
                 initial_visibility: false,
                 reuse_temporal: true,
-                reuse_spatial: true,
+                reuse_spatial: false,
                 avoid_bias: true,
                 max_history: 20,
             },
