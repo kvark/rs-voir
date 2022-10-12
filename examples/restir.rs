@@ -123,6 +123,7 @@ struct Pixel {
     selected_sample: SampleInfo,
     color: glam::Vec3,
     color_accumulated: glam::Vec3,
+    variance_accumulated: f32,
 }
 
 struct RestirConfig {
@@ -247,8 +248,8 @@ impl Render {
                     builder.invalidate();
                     selected_linfo = LightInfo::default();
                 }
-                builder.collapse();
             }
+            builder.collapse();
 
             // Second, reuse the previous frame reservoir.
             if self.config.restir.reuse_temporal {
@@ -371,7 +372,12 @@ impl Render {
                 dir: selected_dir,
                 distance: selected_linfo.distance,
             };
+
             pixel.color = selected_linfo.color * pixel.reservoir.contribution_weight();
+            let variance = (pixel.color - pixel.color_accumulated).length_squared();
+            pixel.variance_accumulated = pixel.variance_accumulated
+                * (1.0 - self.config.accumulation)
+                + self.config.accumulation * variance;
             pixel.color_accumulated = pixel.color_accumulated * (1.0 - self.config.accumulation)
                 + self.config.accumulation * pixel.color;
         }
@@ -454,13 +460,21 @@ impl Render {
             .max(200);
         frame.render_widget(chart_block, top_ver_rects[1]);
 
+        let sum_variance = self
+            .pixels
+            .iter()
+            .map(|pixel| pixel.variance_accumulated)
+            .sum::<f32>();
+        let std_deviation = (sum_variance / self.pixels.len() as f32).sqrt();
         let max_brightness = brightness
             .iter()
             .map(|&(_, br)| br)
             .max()
             .unwrap_or_default();
+
         let info_block = w::Paragraph::new(vec![
             make_key_value("Frame: ", format!("{}", self.frame_index)),
+            make_key_value("Std deviation: ", format!("{}", std_deviation)),
             make_key_value(
                 "Max brightness: ",
                 format!("{:.2}", max_brightness as f32 / 100.0),
