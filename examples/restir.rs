@@ -68,8 +68,34 @@ struct WorldConfig {
     occluder_x: Range<u16>,
 }
 
+#[derive(Clone, Default)]
+struct SampleInfo {
+    dir: glam::Vec2,
+    distance: Option<f32>,
+}
+
+impl SampleInfo {
+    /// Perform a "shift mapping" of one domain to another.
+    fn shift_map(&self, src_origin: glam::Vec2, dst_origin: glam::Vec2) -> glam::Vec2 {
+        match self.distance {
+            Some(distance) => (src_origin + distance * self.dir - dst_origin).normalize(),
+            None => self.dir,
+        }
+    }
+}
+
+#[derive(Default)]
+struct Pixel {
+    reservoir: rs_voir::Reservoir,
+    selected_sample: SampleInfo,
+    color: glam::Vec3,
+    color_accumulated: glam::Vec3,
+    variance_accumulated: f32,
+}
+
 struct WorldView<'a> {
     config: &'a WorldConfig,
+    pixels: &'a [Pixel],
 }
 impl tui::widgets::Widget for WorldView<'_> {
     fn render(self, area: tui::layout::Rect, buf: &mut tui::buffer::Buffer) {
@@ -103,46 +129,25 @@ impl tui::widgets::Widget for WorldView<'_> {
         for x in 0..self.config.surface_length {
             let cell_index = bottom * buf.area.width + x + area.x;
             buf.content[cell_index as usize] = tui::buffer::Cell {
-                symbol: "_".to_string(),
+                symbol: "-".to_string(),
                 fg: Color::Green,
                 ..Default::default()
             };
+            if self.pixels[x as usize].color.length() > 1.0 {
+                buf.content[(cell_index - buf.area.width) as usize] = tui::buffer::Cell {
+                    symbol: ",".to_string(),
+                    fg: Color::White,
+                    ..Default::default()
+                };
+            }
         }
     }
-}
-
-#[derive(Clone, Default)]
-struct SampleInfo {
-    dir: glam::Vec2,
-    distance: Option<f32>,
-}
-
-impl SampleInfo {
-    /// Perform a "shift mapping" of one domain to another.
-    fn shift_map(&self, src_origin: glam::Vec2, dst_origin: glam::Vec2) -> glam::Vec2 {
-        match self.distance {
-            Some(distance) => (src_origin + distance * self.dir - dst_origin).normalize(),
-            None => self.dir,
-        }
-    }
-}
-
-#[derive(Default)]
-struct Pixel {
-    reservoir: rs_voir::Reservoir,
-    selected_sample: SampleInfo,
-    color: glam::Vec3,
-    color_accumulated: glam::Vec3,
-    variance_accumulated: f32,
 }
 
 #[allow(dead_code)]
 enum Convergence {
     Precise,
-    LeanAndMean {
-        initial_visibility: bool,
-        final_visibility: bool,
-    },
+    LeanAndMean { initial_visibility: bool },
 }
 
 struct RestirConfig {
@@ -215,6 +220,7 @@ struct Render {
     pixels: Box<[Pixel]>,
     random: rand::rngs::ThreadRng,
     frame_index: usize,
+    smooth_avg_deviation: f32,
 }
 impl Render {
     fn update(&mut self) {
@@ -328,11 +334,7 @@ impl Render {
                 }
             }
 
-            if let Convergence::LeanAndMean {
-                final_visibility: true,
-                ..
-            } = self.config.restir.convergence
-            {
+            if let Convergence::LeanAndMean { .. } = self.config.restir.convergence {
                 if selected_linfo.target_value() > 0.0
                     && !self
                         .config
@@ -358,6 +360,15 @@ impl Render {
             pixel.color_accumulated = pixel.color_accumulated * (1.0 - self.config.accumulation)
                 + self.config.accumulation * pixel.color;
         }
+
+        let sum_variance = self
+            .pixels
+            .iter()
+            .map(|pixel| pixel.variance_accumulated)
+            .sum::<f32>();
+        let std_deviation = (sum_variance / self.pixels.len() as f32).sqrt();
+        self.smooth_avg_deviation = self.smooth_avg_deviation * (1.0 - self.config.accumulation)
+            + self.config.accumulation * std_deviation;
     }
 
     fn draw<B: tui::backend::Backend>(&self, frame: &mut tui::Frame<B>) {
@@ -398,7 +409,7 @@ impl Render {
             .margin(1)
             .split(frame.size());
 
-        let top_ver_rects = l::Layout::default()
+        let top_vl_rects = l::Layout::default()
             .direction(l::Direction::Vertical)
             .constraints(
                 [
@@ -409,53 +420,58 @@ impl Render {
             )
             .margin(1)
             .split(top_hor_rects[0]);
+        let top_vr_rects = l::Layout::default()
+            .direction(l::Direction::Vertical)
+            .constraints([l::Constraint::Length(5), l::Constraint::Length(10)].as_ref())
+            .margin(1)
+            .split(top_hor_rects[1]);
 
         let world_block = w::Block::default().borders(w::Borders::ALL).title("World");
-        let inner = world_block.inner(top_ver_rects[0]);
-        frame.render_widget(world_block, top_ver_rects[0]);
+        let inner = world_block.inner(top_vl_rects[0]);
+        frame.render_widget(world_block, top_vl_rects[0]);
         frame.render_widget(
             WorldView {
                 config: &self.config.world,
+                pixels: &self.pixels,
             },
             inner,
         );
 
+        let brightness_scale = 100u64;
         let brightness = self
             .pixels
             .iter()
-            .map(|pixel| ("", (pixel.color_accumulated.length() * 100.0) as u64))
+            .map(|pixel| (pixel.color_accumulated.length() * brightness_scale as f32) as u64)
             .collect::<Vec<_>>();
-        let chart_block = w::BarChart::default()
+        let brightness_block = w::Sparkline::default()
             .block(
                 w::Block::default()
-                    .title("Brightness")
+                    .title(format!("Brightness / {}", brightness_scale))
                     .borders(w::Borders::ALL),
             )
             .data(&brightness)
-            .bar_width(1)
-            .bar_gap(0)
-            .max(200);
-        frame.render_widget(chart_block, top_ver_rects[1]);
+            .max(brightness_scale * 2);
+        frame.render_widget(brightness_block, top_vl_rects[1]);
 
-        let sum_variance = self
-            .pixels
-            .iter()
-            .map(|pixel| pixel.variance_accumulated)
-            .sum::<f32>();
-        let std_deviation = (sum_variance / self.pixels.len() as f32).sqrt();
-        let max_brightness = brightness
-            .iter()
-            .map(|&(_, br)| br)
-            .max()
-            .unwrap_or_default();
+        let max_deviation = 5.0;
+        let deviation_color = if self.smooth_avg_deviation < 1.0 {
+            Color::Green
+        } else {
+            Color::Red
+        };
+        let deviation_block = w::Gauge::default()
+            .block(
+                w::Block::default()
+                    .title("Std Deviation")
+                    .borders(w::Borders::ALL),
+            )
+            .gauge_style(Style::default().fg(deviation_color).bg(Color::Black))
+            .label(format!("{:.2}", self.smooth_avg_deviation))
+            .ratio((self.smooth_avg_deviation / max_deviation).min(1.0) as f64);
+        frame.render_widget(deviation_block, top_vr_rects[0]);
 
         let mut text = vec![
             make_key_value("Frame: ", format!("{}", self.frame_index)),
-            make_key_value("Std deviation: ", format!("{}", std_deviation)),
-            make_key_value(
-                "Max brightness: ",
-                format!("{:.2}", max_brightness as f32 / 100.0),
-            ),
             make_key_value(
                 "Initial samples: ",
                 format!("{}", self.config.restir.initial_samples),
@@ -468,18 +484,13 @@ impl Render {
                 },
             ),
         ];
-        if let Convergence::LeanAndMean {
-            initial_visibility,
-            final_visibility,
-        } = self.config.restir.convergence
-        {
+        if let Convergence::LeanAndMean { initial_visibility } = self.config.restir.convergence {
             text.push(make_key_bool("Initial visibility: ", initial_visibility));
-            text.push(make_key_bool("Final visibility: ", final_visibility));
         }
-        let info_block = w::Paragraph::new(text)
+        let text_block = w::Paragraph::new(text)
             .block(w::Block::default().title("Info").borders(w::Borders::ALL))
             .wrap(w::Wrap { trim: true });
-        frame.render_widget(info_block, top_hor_rects[1]);
+        frame.render_widget(text_block, top_vr_rects[1]);
     }
 }
 
@@ -500,7 +511,6 @@ fn main() {
             restir: RestirConfig {
                 convergence: Convergence::LeanAndMean {
                     initial_visibility: true,
-                    final_visibility: true,
                 },
                 initial_samples: 4,
                 max_initial_history: 1,
@@ -512,6 +522,7 @@ fn main() {
         pixels: (0..surface_length).map(|_| Pixel::default()).collect(),
         random: rand::thread_rng(),
         frame_index: 0,
+        smooth_avg_deviation: 0.0,
     };
 
     let mut output = Output::grab().unwrap();
