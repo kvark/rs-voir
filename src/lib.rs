@@ -36,6 +36,14 @@ impl Reservoir {
         self.contribution_weight != 0.0
     }
 
+    /// Return a copy of the reservoir with clamped history.
+    pub fn with_max_history(&self, max_history: u32) -> Self {
+        Self {
+            history: self.history.min(max_history),
+            contribution_weight: self.contribution_weight,
+        }
+    }
+
     /// Convert the reservoir back into a builder state.
     pub fn to_builder(&self, selected_target_pdf: f32) -> ReservoirBuilder {
         ReservoirBuilder {
@@ -53,12 +61,10 @@ impl Reservoir {
 
 impl ReservoirBuilder {
     /// Finish building a reservoir.
-    /// Clamps history to a given value. History clamping allows reservoirs
-    /// to pick up new samples in the future and not get stale.
-    pub fn finish(self, max_history: u32) -> Reservoir {
+    pub fn finish(self) -> Reservoir {
         let denom = self.history as f32 * self.selected_target_pdf;
         Reservoir {
-            history: self.history.min(max_history),
+            history: self.history,
             contribution_weight: if denom > 0.0 {
                 self.weight_sum / denom
             } else {
@@ -73,15 +79,14 @@ impl ReservoirBuilder {
         self.weight_sum = 0.0;
     }
 
-    /// Collapse all the collected samples into one.
-    ///
-    /// This is useful when we want to merge a reservoir with others, but we don't
-    /// consider the currently stored samples to be as valuable individually as
-    /// the ones stored in other reservoirs.
-    pub fn collapse(&mut self) {
-        assert_ne!(self.history, 0);
-        self.weight_sum /= self.history as f32;
-        self.history = 1;
+    /// Reweight the reservoir as if it had less samples.
+    pub fn clamp_history(&mut self, history: u32) {
+        assert_ne!(history, 0);
+        if self.history > history {
+            let avg = self.weight_sum / self.history as f32;
+            self.history = history;
+            self.weight_sum = avg * history as f32;
+        }
     }
 
     /// Stream in a new sample into a reservoir.

@@ -117,6 +117,16 @@ struct SampleInfo {
     distance: Option<f32>,
 }
 
+impl SampleInfo {
+    /// Perform a "shift mapping" of one domain to another.
+    fn shift_map(&self, src_origin: glam::Vec2, dst_origin: glam::Vec2) -> glam::Vec2 {
+        match self.distance {
+            Some(distance) => (src_origin + distance * self.dir - dst_origin).normalize(),
+            None => self.dir,
+        }
+    }
+}
+
 #[derive(Default)]
 struct Pixel {
     reservoir: rs_voir::Reservoir,
@@ -126,13 +136,21 @@ struct Pixel {
     variance_accumulated: f32,
 }
 
+#[allow(dead_code)]
+enum Convergence {
+    Precise,
+    LeanAndMean {
+        initial_visibility: bool,
+        final_visibility: bool,
+    },
+}
+
 struct RestirConfig {
+    convergence: Convergence,
     initial_samples: u32,
-    initial_visibility: bool,
-    reuse_temporal: bool,
-    reuse_spatial: bool,
-    avoid_bias: bool,
-    max_history: u32,
+    max_initial_history: u32,
+    max_temporal_history: u32,
+    max_spatial_history: u32,
 }
 
 struct Config {
@@ -223,151 +241,110 @@ impl Render {
                 // generate a random direction in the hemisphere
                 let alpha = self.random.gen_range(0.0..=PI);
                 let dir = glam::vec2(alpha.cos(), alpha.sin());
-                if self.config.restir.initial_visibility
-                    && !self.config.world.check_visibility(surface_pos, dir)
-                {
-                    builder.add_empty_sample();
-                } else {
+                let is_visible = match self.config.restir.convergence {
+                    Convergence::Precise => self.config.world.check_visibility(surface_pos, dir),
+                    Convergence::LeanAndMean { .. } => true,
+                };
+                if is_visible {
                     let linfo = self.config.world.get_incoming_light(surface_pos, dir);
                     if builder.stream(1.0 / PI, linfo.target_value(), &mut self.random) {
                         selected_dir = dir;
                         selected_linfo = linfo;
                     }
+                } else {
+                    builder.add_empty_sample();
                 }
             }
 
-            // From now on, we consider visibility to be a part of the target PDF.
-            // Therefore, if the given reservoir was built without visibility checks,
-            // it's time to collapse it to one sample, which we also check now.
-            if !self.config.restir.initial_visibility {
+            if let Convergence::LeanAndMean {
+                initial_visibility: true,
+                ..
+            } = self.config.restir.convergence
+            {
                 if !self
                     .config
                     .world
                     .check_visibility(surface_pos, selected_dir)
                 {
-                    builder.invalidate();
                     selected_linfo = LightInfo::default();
                 }
             }
-            builder.collapse();
+            builder.clamp_history(self.config.restir.max_initial_history);
 
             // Second, reuse the previous frame reservoir.
-            if self.config.restir.reuse_temporal {
+            if self.config.restir.max_temporal_history != 0 {
                 let (ref prev_reservoir, ref prev_sample) = backup[cell_index];
-                if prev_reservoir.has_weight() {
+                let prev = prev_reservoir.with_max_history(self.config.restir.max_temporal_history);
+                if prev.has_weight() {
                     // reconstruct the target PDF
                     let linfo = self
                         .config
                         .world
                         .get_incoming_light(surface_pos, pixel.selected_sample.dir);
-                    let other = prev_reservoir.to_builder(linfo.target_value());
+                    let other = prev.to_builder(linfo.target_value());
                     if builder.merge(&other, &mut self.random) {
                         selected_dir = prev_sample.dir;
                         selected_linfo = linfo;
                     }
                 } else {
-                    builder.merge_history(prev_reservoir);
+                    builder.merge_history(&prev);
                 }
             }
 
             // Third, reuse the previous frame neighboring reservoirs
-            if self.config.restir.reuse_spatial {
-                // The current `builder` is the "canonical" reservoir -
-                // one that can be trusted. We want to try merging other reservoirs,
-                // which may be biased, but we'll only know it after the merge.
-                let mut is_changed = false;
-                // First pass, merge all valid reservoirs in, just to find the winning sample.
+            if self.config.restir.max_spatial_history != 0 {
                 for offset in [-1, 1] {
                     let index = cell_index as isize + offset;
                     if index < 0 || index >= self.config.world.surface_length as isize {
                         continue;
                     }
                     let (ref prev_reservoir, ref prev_sample) = backup[index as usize];
+                    let prev =
+                        prev_reservoir.with_max_history(self.config.restir.max_spatial_history);
                     let other_pos = surface_pos + glam::vec2(offset as f32, 0.0);
 
-                    if prev_reservoir.has_weight() {
-                        // shift map the direction to the current sample
-                        let dir = match prev_sample.distance {
-                            Some(distance) => {
-                                (other_pos + distance * prev_sample.dir - surface_pos).normalize()
+                    if prev.has_weight() {
+                        let dir = prev_sample.shift_map(other_pos, surface_pos);
+                        let is_visible = match self.config.restir.convergence {
+                            Convergence::Precise => {
+                                self.config.world.check_visibility(surface_pos, dir)
                             }
-                            None => prev_sample.dir,
+                            Convergence::LeanAndMean { .. } => true,
                         };
-                        // reconstruct the target PDF
-                        let linfo = self.config.world.get_incoming_light(surface_pos, dir);
-                        let other = prev_reservoir.to_builder(linfo.target_value());
-                        if builder.merge(&other, &mut self.random) {
-                            selected_dir = dir;
-                            selected_linfo = linfo;
-                            is_changed = true;
-                        }
-                    } else {
-                        builder.merge_history(prev_reservoir);
-                    }
-                }
-
-                if self.config.restir.avoid_bias {
-                    // Now go through the neighbors again, and check if they need to participate.
-                    for offset in [-1, 1] {
-                        let index = cell_index as isize + offset;
-                        if index < 0 || index >= self.config.world.surface_length as isize {
-                            continue;
-                        }
-                        let (ref prev_reservoir, ref prev_sample) = backup[index as usize];
-                        let other_pos = surface_pos + glam::vec2(offset as f32, 0.0);
-
-                        // shift map the direction to the other sample
-                        let visibility_dir = match selected_linfo.distance {
-                            Some(distance) => {
-                                (surface_pos + distance * selected_dir - other_pos).normalize()
-                            }
-                            None => selected_dir,
-                        };
-                        if self
-                            .config
-                            .world
-                            .check_visibility(other_pos, visibility_dir)
-                        {
-                            // Selected light/direction is visible from the neighbor,
-                            // nothing to fix here.
-                            continue;
-                        }
-
-                        // We detected that the chosen sample couldn't be visible from this
-                        // neighbor location, so we reject the neighbors contribution.
-                        if prev_reservoir.has_weight() {
-                            // shift map the direction to the current sample
-                            let dir = match prev_sample.distance {
-                                Some(distance) => (other_pos + distance * prev_sample.dir
-                                    - surface_pos)
-                                    .normalize(),
-                                None => prev_sample.dir,
-                            };
+                        if is_visible {
                             // reconstruct the target PDF
                             let linfo = self.config.world.get_incoming_light(surface_pos, dir);
-                            let other = prev_reservoir.to_builder(linfo.target_value());
-                            builder.unmerge(&other);
+                            let other = prev.to_builder(linfo.target_value());
+                            if builder.merge(&other, &mut self.random) {
+                                selected_dir = dir;
+                                selected_linfo = linfo;
+                            }
                         } else {
-                            builder.unmerge_history(prev_reservoir);
+                            builder.merge_history(&prev);
                         }
+                    } else {
+                        builder.merge_history(&prev);
                     }
                 }
+            }
 
-                // Finally, do the visibility check on the winning sample.
-                // During the spatial re-use we assumed the chosen sample was visible,
-                // but that assumption may not hold, so now is time to fix this.
-                if is_changed
+            if let Convergence::LeanAndMean {
+                final_visibility: true,
+                ..
+            } = self.config.restir.convergence
+            {
+                if selected_linfo.target_value() > 0.0
                     && !self
                         .config
                         .world
                         .check_visibility(surface_pos, selected_dir)
                 {
-                    builder.invalidate();
+                    selected_linfo = LightInfo::default();
                 }
             }
 
             // Finally write out the results
-            pixel.reservoir = builder.finish(self.config.restir.max_history);
+            pixel.reservoir = builder.finish();
             pixel.selected_sample = SampleInfo {
                 dir: selected_dir,
                 distance: selected_linfo.distance,
@@ -472,7 +449,7 @@ impl Render {
             .max()
             .unwrap_or_default();
 
-        let info_block = w::Paragraph::new(vec![
+        let mut text = vec![
             make_key_value("Frame: ", format!("{}", self.frame_index)),
             make_key_value("Std deviation: ", format!("{}", std_deviation)),
             make_key_value(
@@ -483,20 +460,25 @@ impl Render {
                 "Initial samples: ",
                 format!("{}", self.config.restir.initial_samples),
             ),
-            make_key_bool(
-                "Initial visibility: ",
-                self.config.restir.initial_visibility,
-            ),
-            make_key_bool("Temporal reuse: ", self.config.restir.reuse_temporal),
-            make_key_bool("Spatial reuse: ", self.config.restir.reuse_spatial),
-            make_key_bool("Spatial de-biasing: ", self.config.restir.avoid_bias),
             make_key_value(
-                "History clamp: ",
-                format!("{}", self.config.restir.max_history),
+                "Convergence: ",
+                match self.config.restir.convergence {
+                    Convergence::Precise => "Precise".to_string(),
+                    Convergence::LeanAndMean { .. } => "Lean&Mean".to_string(),
+                },
             ),
-        ])
-        .block(w::Block::default().title("Info").borders(w::Borders::ALL))
-        .wrap(w::Wrap { trim: true });
+        ];
+        if let Convergence::LeanAndMean {
+            initial_visibility,
+            final_visibility,
+        } = self.config.restir.convergence
+        {
+            text.push(make_key_bool("Initial visibility: ", initial_visibility));
+            text.push(make_key_bool("Final visibility: ", final_visibility));
+        }
+        let info_block = w::Paragraph::new(text)
+            .block(w::Block::default().title("Info").borders(w::Borders::ALL))
+            .wrap(w::Wrap { trim: true });
         frame.render_widget(info_block, top_hor_rects[1]);
     }
 }
@@ -516,12 +498,14 @@ fn main() {
                 occluder_x: 7..15,
             },
             restir: RestirConfig {
+                convergence: Convergence::LeanAndMean {
+                    initial_visibility: true,
+                    final_visibility: true,
+                },
                 initial_samples: 4,
-                initial_visibility: false,
-                reuse_temporal: true,
-                reuse_spatial: false,
-                avoid_bias: true,
-                max_history: 20,
+                max_initial_history: 1,
+                max_temporal_history: 20,
+                max_spatial_history: 10,
             },
             accumulation: 0.01,
         },
