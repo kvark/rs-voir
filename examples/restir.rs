@@ -146,7 +146,7 @@ impl tui::widgets::Widget for WorldView<'_> {
 
 #[allow(dead_code)]
 enum Convergence {
-    Precise,
+    Precise { unbias: bool },
     LeanAndMean { initial_visibility: bool },
 }
 
@@ -248,7 +248,9 @@ impl Render {
                 let alpha = self.random.gen_range(0.0..=PI);
                 let dir = glam::vec2(alpha.cos(), alpha.sin());
                 let is_visible = match self.config.restir.convergence {
-                    Convergence::Precise => self.config.world.check_visibility(surface_pos, dir),
+                    Convergence::Precise { .. } => {
+                        self.config.world.check_visibility(surface_pos, dir)
+                    }
                     Convergence::LeanAndMean { .. } => true,
                 };
                 if is_visible {
@@ -299,7 +301,11 @@ impl Render {
 
             // Third, reuse the previous frame neighboring reservoirs
             if self.config.restir.max_spatial_history != 0 {
-                for offset in [-1, 1] {
+                let mut cached_reservoirs = [None, None];
+                let mut selected_cell = -1;
+                for (offset, cached_reservoir) in
+                    [-1, 1].into_iter().zip(cached_reservoirs.iter_mut())
+                {
                     let index = cell_index as isize + offset;
                     if index < 0 || index >= self.config.world.surface_length as isize {
                         continue;
@@ -310,26 +316,59 @@ impl Render {
                     let other_pos = surface_pos + glam::vec2(offset as f32, 0.0);
 
                     if prev.has_weight() {
-                        let dir = prev_sample.shift_map(other_pos, surface_pos);
+                        let surface_dir = prev_sample.shift_map(other_pos, surface_pos);
                         let is_visible = match self.config.restir.convergence {
-                            Convergence::Precise => {
-                                self.config.world.check_visibility(surface_pos, dir)
+                            Convergence::Precise { .. } => {
+                                self.config.world.check_visibility(surface_pos, surface_dir)
                             }
                             Convergence::LeanAndMean { .. } => true,
                         };
                         if is_visible {
                             // reconstruct the target PDF
-                            let linfo = self.config.world.get_incoming_light(surface_pos, dir);
+                            let linfo = self
+                                .config
+                                .world
+                                .get_incoming_light(surface_pos, surface_dir);
                             let other = prev.to_builder(linfo.target_value());
                             if builder.merge(&other, &mut self.random) {
-                                selected_dir = dir;
+                                selected_dir = surface_dir;
                                 selected_linfo = linfo;
+                                selected_cell = index;
                             }
+                            *cached_reservoir = Some(other);
                         } else {
                             builder.merge_history(&prev);
                         }
                     } else {
                         builder.merge_history(&prev);
+                    }
+                }
+
+                // Post-factum reject reservoirs that couldn't have produced this sample.
+                if let Convergence::Precise { unbias: true } = self.config.restir.convergence {
+                    let selected_sample = SampleInfo {
+                        dir: selected_dir,
+                        distance: selected_linfo.distance,
+                    };
+                    for (offset, cached_reservoir) in [-1, 1].into_iter().zip(cached_reservoirs) {
+                        let index = cell_index as isize + offset;
+                        if index < 0
+                            || index >= self.config.world.surface_length as isize
+                            || index == selected_cell
+                        {
+                            continue;
+                        }
+                        let (ref prev_reservoir, _) = backup[index as usize];
+                        let prev =
+                            prev_reservoir.with_max_history(self.config.restir.max_spatial_history);
+                        let other_pos = surface_pos + glam::vec2(offset as f32, 0.0);
+                        let other_dir = selected_sample.shift_map(surface_pos, other_pos);
+                        if !self.config.world.check_visibility(other_pos, other_dir) {
+                            match cached_reservoir {
+                                Some(ref other) => builder.unmerge(other),
+                                None => builder.unmerge_history(&prev),
+                            }
+                        }
                     }
                 }
             }
@@ -479,13 +518,18 @@ impl Render {
             make_key_value(
                 "Convergence: ",
                 match self.config.restir.convergence {
-                    Convergence::Precise => "Precise".to_string(),
+                    Convergence::Precise { .. } => "Precise".to_string(),
                     Convergence::LeanAndMean { .. } => "Lean&Mean".to_string(),
                 },
             ),
         ];
-        if let Convergence::LeanAndMean { initial_visibility } = self.config.restir.convergence {
-            text.push(make_key_bool("Initial visibility: ", initial_visibility));
+        match self.config.restir.convergence {
+            Convergence::Precise { unbias } => {
+                text.push(make_key_bool("Unbias: ", unbias));
+            }
+            Convergence::LeanAndMean { initial_visibility } => {
+                text.push(make_key_bool("Initial visibility: ", initial_visibility));
+            }
         }
         let text_block = w::Paragraph::new(text)
             .block(w::Block::default().title("Info").borders(w::Borders::ALL))
@@ -509,9 +553,7 @@ fn main() {
                 occluder_x: 7..15,
             },
             restir: RestirConfig {
-                convergence: Convergence::LeanAndMean {
-                    initial_visibility: true,
-                },
+                convergence: Convergence::Precise { unbias: true },
                 initial_samples: 4,
                 max_initial_history: 1,
                 max_temporal_history: 20,
