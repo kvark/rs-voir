@@ -57,12 +57,24 @@ impl Reservoir {
     pub fn contribution_weight(&self) -> f32 {
         self.contribution_weight
     }
+
+    /// Return the stored history.
+    pub fn history(&self) -> u32 {
+        self.history
+    }
 }
 
 impl ReservoirBuilder {
     /// Finish building a reservoir.
     pub fn finish(self) -> Reservoir {
-        let denom = self.history as f32 * self.selected_target_pdf;
+        let history = self.history;
+        self.finish_with_history(history)
+    }
+
+    /// Finish building a reservoir, using the given history
+    /// for weighting (while the stored history is unaffected).
+    pub fn finish_with_history(self, unbiased_history: u32) -> Reservoir {
+        let denom = unbiased_history as f32 * self.selected_target_pdf;
         Reservoir {
             history: self.history,
             contribution_weight: if denom > 0.0 {
@@ -87,6 +99,11 @@ impl ReservoirBuilder {
             self.history = history;
             self.weight_sum = avg * history as f32;
         }
+    }
+
+    /// Return the stored history.
+    pub fn history(&self) -> u32 {
+        self.history
     }
 
     /// Stream in a new sample into a reservoir.
@@ -136,16 +153,5 @@ impl ReservoirBuilder {
     /// Merge history from another reservoir that has no weight.
     pub fn merge_history(&mut self, other: &Reservoir) {
         self.history += other.history;
-    }
-
-    /// Reverse the effect of merging a reservoir.
-    pub fn unmerge(&mut self, other: &Self) {
-        self.weight_sum -= other.weight_sum;
-        self.history -= other.history;
-    }
-
-    /// Reverse the effect of merging other reservoirs history.
-    pub fn unmerge_history(&mut self, other: &Reservoir) {
-        self.history -= other.history;
     }
 }

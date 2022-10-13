@@ -300,12 +300,10 @@ impl Render {
             }
 
             // Third, reuse the previous frame neighboring reservoirs
+            let mut unbiased_history = builder.history();
             if self.config.restir.max_spatial_history != 0 {
-                let mut cached_reservoirs = [None, None];
                 let mut selected_cell = -1;
-                for (offset, cached_reservoir) in
-                    [-1, 1].into_iter().zip(cached_reservoirs.iter_mut())
-                {
+                for offset in [-1, 1] {
                     let index = cell_index as isize + offset;
                     if index < 0 || index >= self.config.world.surface_length as isize {
                         continue;
@@ -335,7 +333,6 @@ impl Render {
                                 selected_linfo = linfo;
                                 selected_cell = index;
                             }
-                            *cached_reservoir = Some(other);
                         } else {
                             builder.merge_history(&prev);
                         }
@@ -350,26 +347,27 @@ impl Render {
                         dir: selected_dir,
                         distance: selected_linfo.distance,
                     };
-                    for (offset, cached_reservoir) in [-1, 1].into_iter().zip(cached_reservoirs) {
+                    for offset in [-1, 1] {
                         let index = cell_index as isize + offset;
-                        if index < 0
-                            || index >= self.config.world.surface_length as isize
-                            || index == selected_cell
-                        {
+                        if index < 0 || index >= self.config.world.surface_length as isize {
                             continue;
                         }
                         let (ref prev_reservoir, _) = backup[index as usize];
-                        let prev =
-                            prev_reservoir.with_max_history(self.config.restir.max_spatial_history);
-                        let other_pos = surface_pos + glam::vec2(offset as f32, 0.0);
-                        let other_dir = selected_sample.shift_map(surface_pos, other_pos);
-                        if !self.config.world.check_visibility(other_pos, other_dir) {
-                            match cached_reservoir {
-                                Some(ref other) => builder.unmerge(other),
-                                None => builder.unmerge_history(&prev),
-                            }
+                        let covers_domain = if index == selected_cell {
+                            true
+                        } else {
+                            let other_pos = surface_pos + glam::vec2(offset as f32, 0.0);
+                            let other_dir = selected_sample.shift_map(surface_pos, other_pos);
+                            self.config.world.check_visibility(other_pos, other_dir)
+                        };
+                        if covers_domain {
+                            unbiased_history += prev_reservoir
+                                .with_max_history(self.config.restir.max_spatial_history)
+                                .history();
                         }
                     }
+                } else {
+                    unbiased_history = builder.history();
                 }
             }
 
@@ -385,7 +383,7 @@ impl Render {
             }
 
             // Finally write out the results
-            pixel.reservoir = builder.finish();
+            pixel.reservoir = builder.finish_with_history(unbiased_history);
             pixel.selected_sample = SampleInfo {
                 dir: selected_dir,
                 distance: selected_linfo.distance,
@@ -554,6 +552,7 @@ fn main() {
             },
             restir: RestirConfig {
                 convergence: Convergence::Precise { unbias: true },
+                //convergence: Convergence::LeanAndMean { initial_visibility: true },
                 initial_samples: 4,
                 max_initial_history: 1,
                 max_temporal_history: 20,
