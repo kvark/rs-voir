@@ -10,6 +10,10 @@ The 2D world consists of:
 This example implements ReSTIR for this world,
 and shows the averaged (over time) brightness
 for each point on the ground.
+
+Note: unlike Nvidia's RTXDI, the sun in this example isn't
+represented as a light source. Instead, it's a part of the environment.
+This is for demonstration purposes only.
 !*/
 
 use std::{ops::Range, time::Duration};
@@ -71,13 +75,13 @@ struct WorldConfig {
 #[derive(Clone, Default)]
 struct SampleInfo {
     dir: glam::Vec2,
-    distance: Option<f32>,
+    light: LightInfo,
 }
 
 impl SampleInfo {
     /// Perform a "shift mapping" of one domain to another.
     fn shift_map(&self, src_origin: glam::Vec2, dst_origin: glam::Vec2) -> glam::Vec2 {
-        match self.distance {
+        match self.light.distance {
             Some(distance) => (src_origin + distance * self.dir - dst_origin).normalize(),
             None => self.dir,
         }
@@ -164,7 +168,7 @@ struct Config {
     accumulation: f32,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct LightInfo {
     color: glam::Vec3,
     distance: Option<f32>,
@@ -239,8 +243,7 @@ impl Render {
         for (cell_index, pixel) in self.pixels.iter_mut().enumerate() {
             let surface_pos = glam::vec2(cell_index as f32 + 0.5, 0.0);
             let mut builder = rs_voir::ReservoirBuilder::default();
-            let mut selected_dir = glam::Vec2::ZERO;
-            let mut selected_linfo = LightInfo::default();
+            let mut selected = SampleInfo::default();
 
             // First, do RIS on the initial samples
             for _ in 0..self.config.restir.initial_samples {
@@ -254,10 +257,9 @@ impl Render {
                     Convergence::LeanAndMean { .. } => true,
                 };
                 if is_visible {
-                    let linfo = self.config.world.get_incoming_light(surface_pos, dir);
-                    if builder.stream(1.0 / PI, linfo.target_value(), &mut self.random) {
-                        selected_dir = dir;
-                        selected_linfo = linfo;
+                    let light = self.config.world.get_incoming_light(surface_pos, dir);
+                    if builder.stream(1.0 / PI, light.target_value(), &mut self.random) {
+                        selected = SampleInfo { dir, light };
                     }
                 } else {
                     builder.add_empty_sample();
@@ -272,9 +274,9 @@ impl Render {
                 if !self
                     .config
                     .world
-                    .check_visibility(surface_pos, selected_dir)
+                    .check_visibility(surface_pos, selected.dir)
                 {
-                    selected_linfo = LightInfo::default();
+                    selected.light = LightInfo::default();
                 }
             }
             builder.clamp_history(self.config.restir.max_initial_history);
@@ -284,15 +286,9 @@ impl Render {
                 let (ref prev_reservoir, ref prev_sample) = backup[cell_index];
                 let prev = prev_reservoir.with_max_history(self.config.restir.max_temporal_history);
                 if prev.has_weight() {
-                    // reconstruct the target PDF
-                    let linfo = self
-                        .config
-                        .world
-                        .get_incoming_light(surface_pos, pixel.selected_sample.dir);
-                    let other = prev.to_builder(linfo.target_value());
+                    let other = prev.to_builder(prev_sample.light.target_value());
                     if builder.merge(&other, &mut self.random) {
-                        selected_dir = prev_sample.dir;
-                        selected_linfo = linfo;
+                        selected = prev_sample.clone();
                     }
                 } else {
                     builder.merge_history(&prev);
@@ -322,15 +318,12 @@ impl Render {
                             Convergence::LeanAndMean { .. } => true,
                         };
                         if is_visible {
-                            // reconstruct the target PDF
-                            let linfo = self
-                                .config
-                                .world
-                                .get_incoming_light(surface_pos, surface_dir);
-                            let other = prev.to_builder(linfo.target_value());
+                            let other = prev.to_builder(prev_sample.light.target_value());
                             if builder.merge(&other, &mut self.random) {
-                                selected_dir = surface_dir;
-                                selected_linfo = linfo;
+                                selected = SampleInfo {
+                                    dir: surface_dir,
+                                    light: prev_sample.light.clone(),
+                                };
                                 selected_cell = index;
                             }
                         } else {
@@ -343,10 +336,6 @@ impl Render {
 
                 // Post-factum reject reservoirs that couldn't have produced this sample.
                 if let Convergence::Precise { unbias: true } = self.config.restir.convergence {
-                    let selected_sample = SampleInfo {
-                        dir: selected_dir,
-                        distance: selected_linfo.distance,
-                    };
                     for offset in [-1, 1] {
                         let index = cell_index as isize + offset;
                         if index < 0 || index >= self.config.world.surface_length as isize {
@@ -357,7 +346,7 @@ impl Render {
                             true
                         } else {
                             let other_pos = surface_pos + glam::vec2(offset as f32, 0.0);
-                            let other_dir = selected_sample.shift_map(surface_pos, other_pos);
+                            let other_dir = selected.shift_map(surface_pos, other_pos);
                             self.config.world.check_visibility(other_pos, other_dir)
                         };
                         if covers_domain {
@@ -372,24 +361,20 @@ impl Render {
             }
 
             if let Convergence::LeanAndMean { .. } = self.config.restir.convergence {
-                if selected_linfo.target_value() > 0.0
+                if selected.light.target_value() > 0.0
                     && !self
                         .config
                         .world
-                        .check_visibility(surface_pos, selected_dir)
+                        .check_visibility(surface_pos, selected.dir)
                 {
-                    selected_linfo = LightInfo::default();
+                    selected.light = LightInfo::default();
                 }
             }
 
             // Finally write out the results
             pixel.reservoir = builder.finish_with_history(unbiased_history);
-            pixel.selected_sample = SampleInfo {
-                dir: selected_dir,
-                distance: selected_linfo.distance,
-            };
-
-            pixel.color = selected_linfo.color * pixel.reservoir.contribution_weight();
+            pixel.selected_sample = selected;
+            pixel.color = pixel.selected_sample.light.color * pixel.reservoir.contribution_weight();
             let variance = (pixel.color - pixel.color_accumulated).length_squared();
             pixel.variance_accumulated = pixel.variance_accumulated
                 * (1.0 - self.config.accumulation)
@@ -551,8 +536,8 @@ fn main() {
                 occluder_x: 7..15,
             },
             restir: RestirConfig {
-                convergence: Convergence::Precise { unbias: true },
-                //convergence: Convergence::LeanAndMean { initial_visibility: true },
+                //convergence: Convergence::Precise { unbias: true },
+                convergence: Convergence::LeanAndMean { initial_visibility: true },
                 initial_samples: 4,
                 max_initial_history: 1,
                 max_temporal_history: 20,
