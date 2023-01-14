@@ -148,9 +148,11 @@ impl tui::widgets::Widget for WorldView<'_> {
     }
 }
 
-#[allow(dead_code)]
+#[derive(Clone, Copy, Debug)]
 enum Convergence {
+    /// Check visibility of every sample taken.
     Precise { unbias: bool },
+    /// Check visibility as little as possible.
     LeanAndMean { initial_visibility: bool },
 }
 
@@ -498,6 +500,14 @@ impl Render {
                 "Initial samples: ",
                 format!("{}", self.config.restir.initial_samples),
             ),
+            make_key_bool(
+                "Temporal resample: ",
+                self.config.restir.max_temporal_history != 0,
+            ),
+            make_key_bool(
+                "Spatial resample: ",
+                self.config.restir.max_spatial_history != 0,
+            ),
             make_key_value(
                 "Convergence: ",
                 match self.config.restir.convergence {
@@ -525,6 +535,21 @@ fn main() {
     use crossterm::event as ev;
 
     let surface_length = 40;
+    let mut convergence_index = 0;
+    let convergence_list = &[
+        Convergence::LeanAndMean {
+            initial_visibility: false,
+        },
+        Convergence::LeanAndMean {
+            initial_visibility: true,
+        },
+        Convergence::Precise { unbias: false },
+        Convergence::Precise { unbias: true },
+    ];
+    let temporal_history = 20;
+    let spatial_history = 10;
+    let mut sun_drag_start = None;
+
     let mut render = Render {
         config: Config {
             world: WorldConfig {
@@ -536,12 +561,11 @@ fn main() {
                 occluder_x: 7..15,
             },
             restir: RestirConfig {
-                //convergence: Convergence::Precise { unbias: true },
-                convergence: Convergence::LeanAndMean { initial_visibility: true },
-                initial_samples: 4,
+                convergence: convergence_list[convergence_index],
+                initial_samples: 1,
                 max_initial_history: 1,
-                max_temporal_history: 20,
-                max_spatial_history: 10,
+                max_temporal_history: 0,
+                max_spatial_history: 0,
             },
             accumulation: 0.01,
         },
@@ -563,9 +587,58 @@ fn main() {
                     ev::KeyCode::Esc => {
                         return;
                     }
+                    ev::KeyCode::Char('c') => {
+                        convergence_index = (convergence_index + 1) % convergence_list.len();
+                        render.config.restir.convergence = convergence_list[convergence_index];
+                    }
+                    ev::KeyCode::Char(',') => {
+                        if render.config.restir.initial_samples != 0 {
+                            render.config.restir.initial_samples -= 1;
+                        }
+                    }
+                    ev::KeyCode::Char('.') => {
+                        render.config.restir.initial_samples += 1;
+                    }
+                    ev::KeyCode::Char('s') => {
+                        render.config.restir.max_spatial_history =
+                            if render.config.restir.max_spatial_history == 0 {
+                                spatial_history
+                            } else {
+                                0
+                            };
+                    }
+                    ev::KeyCode::Char('t') => {
+                        render.config.restir.max_temporal_history =
+                            if render.config.restir.max_temporal_history == 0 {
+                                temporal_history
+                            } else {
+                                0
+                            };
+                    }
                     _ => {}
                 },
-                _ => {}
+                ev::Event::Mouse(ev::MouseEvent {
+                    kind,
+                    column,
+                    row,
+                    modifiers: _,
+                }) => match kind {
+                    ev::MouseEventKind::Down(ev::MouseButton::Left) => {
+                        sun_drag_start = Some(([column, row], render.config.world.sun_position));
+                    }
+                    ev::MouseEventKind::Up(ev::MouseButton::Left) => {
+                        sun_drag_start = None;
+                    }
+                    ev::MouseEventKind::Drag(ev::MouseButton::Left) => {
+                        if let Some((src_start_pos, dst_start_pos)) = sun_drag_start {
+                            render.config.world.sun_position = [
+                                dst_start_pos[0] + column - src_start_pos[0],
+                                dst_start_pos[1] + src_start_pos[1] - row,
+                            ];
+                        }
+                    }
+                    _ => {}
+                },
             }
         }
     }
